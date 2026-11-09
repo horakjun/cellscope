@@ -14,7 +14,7 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   class Link {
-    constructor(port) { this.port = port; this.buf = ""; this.baud = 0; this.reader = null; this.loop = null; this.wake = null; }
+    constructor(port) { this.port = port; this.buf = ""; this.baud = 0; this.reader = null; this.loop = null; this.wake = null; this.trace = []; }
 
     async open(baud = BAUD) {
       await this.port.open({ baudRate: baud, dataBits: 8, parity: "none", stopBits: 1, flowControl: "none" });
@@ -67,41 +67,57 @@
       const t0 = Date.now();
       let len = -1;
       while (Date.now() - t0 < limitMs && this.buf.length !== len) { len = this.buf.length; await sleep(quietMs); }
+      const n = this.buf.length;
       this.buf = "";
+      return n;
+    }
+
+    /* srovnání s konzolí: počkat na ticho, pak Enter a čistý prompt.
+       "ok" = prompt je tu, "noise" = něco chodí, ale prompt ne (konzole je vzhůru), "silent" = vůbec nic (spí) */
+    async sync(tries = 3) {
+      let any = (await this.drain(300, 3000)) > 0;
+      for (let i = 0; i < tries; i++) {
+        this.buf = "";
+        await this.writeRaw("\r");
+        const ok = await this.waitFor(b => />\s*$/.test(b), 2000);
+        if (this.buf.length) any = true;
+        if (ok) { await this.drain(150, 800); return "ok"; }
+      }
+      return any ? "noise" : "silent";
     }
 
     /* jeden čtecí příkaz se stránkováním (na výzvu „Press [Enter]“ se posílá jen Enter).
        Vrací text; this.lastOk = false, když nedorazil konec odpovědi „$$“. */
     async cmd(c, maxPages = 60, limitMs = 15000) {
       if (!isAllowed(c)) throw new Error("Příkaz není povolen: " + c);
+      const t0 = Date.now();
+      if (this.buf.length) await this.drain(200, 2000);   // zbytek předchozího výstupu nechat doběhnout
       this.buf = "";
       await this.writeRaw(c + "\r");
-      let out = "";
+      // odpověď se počítá až od ozvěny právě odeslaného příkazu (zbytky starého výstupu se nepočítají)
+      const echo = new RegExp("(^|[\\r\\n])[^\\r\\n]*?" + c.replace(/ /g, "\\s+") + "\\s*[\\r\\n]");
+      const tail = b => { const m = echo.exec(b); return m ? b.slice(m.index) : (Date.now() - t0 > 4000 ? b : null); };
+      let out = "", p = 0;
       this.lastOk = false;
-      for (let p = 0; p < maxPages; p++) {
-        const got = await this.waitFor(b => /\$\$/.test(b) || /Press \[Enter\]/.test(b), limitMs);
-        const done = /\$\$/.test(this.buf);
-        if (done) {
+      for (; p < maxPages; p++) {
+        const part = b => (p === 0 ? tail(b) : b);
+        const got = await this.waitFor(b => { const s = part(b); return s != null && (/\$\$/.test(s) || /Press \[Enter\]/.test(s)); }, limitMs);
+        const s = part(this.buf) ?? this.buf;
+        if (/\$\$/.test(s)) {
           // po „$$“ ještě dorazí prompt – počkat na něj, ať nezůstane v odpovědi dalšího příkazu
-          const k = this.buf.indexOf("$$");
-          await this.waitFor(b => />\s*$/.test(b.slice(k)), 600);
-          out += this.buf; this.buf = ""; this.lastOk = true; break;
+          await this.waitFor(b => />\s*$/.test(b), 600);
+          out += part(this.buf) ?? this.buf; this.buf = ""; this.lastOk = true; break;
         }
-        out += this.buf;
-        const more = got && /Press \[Enter\]/.test(this.buf);
+        out += s;
+        const more = got && /Press \[Enter\]/.test(s);
         this.buf = "";
         if (!more) { await this.drain(); break; }    // konec nedorazil – nechat doběhnout, ať se nemíchá s dalším příkazem
         await this.writeRaw("\r");
       }
+      this.trace.push({ c, ms: Date.now() - t0, ok: this.lastOk, pages: p + 1 });
       return out;
     }
 
-    /* prázdný řádek – jen zjistí, jestli konzole odpovídá promptem */
-    async ping() {
-      this.buf = "";
-      await this.writeRaw("\r");
-      return this.waitFor(b => />\s*$/.test(b) || /pylon/i.test(b), 1500, 600);
-    }
 
     async wakeUp() {
       await this.close();
@@ -120,25 +136,26 @@
     const step = (key, vars = {}, pct) => onStep({ key, vars, pct });
     /* příkaz; když nedorazí konec odpovědi, zkusí se ještě jednou */
     const run = async c => {
-      let t = await link.cmd(c);
-      if (!link.lastOk) { await link.drain(500, 4000); t = await link.cmd(c); }
-      raw[c] = t; onRaw(c, t); return t;
+      let t = await link.cmd(c), retried = false;
+      if (!link.lastOk) { retried = true; await link.drain(500, 4000); t = await link.cmd(c); }
+      raw[c] = t; onRaw(c, t, link.trace[link.trace.length - 1], retried); return t;
     };
 
     step("step_open", { p: opt.portName || "COM" }, 2);
     await link.open(BAUD);
     let woke = false;
-    // první dotaz krátce a bez opakování – spící konzole neodpoví vůbec
-    let t = await link.cmd("pwr", 60, 3000);
-    if (!/Power\s+Volt/.test(t)) await link.drain(300, 1500);
-    else { raw.pwr = t; onRaw("pwr", t); }
-    if (!/Power\s+Volt/.test(t)) {
+    // probouzecí řetězec (1200 Bd) jen když konzole nevrátí vůbec nic – probuzené konzoli by ho poslal jako nesmysly
+    let sy = await link.sync();
+    if (sy === "silent") {
       step("step_wake", {}, 5);
       await link.wakeUp();
       woke = true;
-      t = await run("pwr");
-      if (!/Power\s+Volt/.test(t)) throw new Error("NO_RESPONSE");
+      sy = await link.sync();
+      if (sy === "silent") { await link.close(); throw new Error("NO_RESPONSE"); }
     }
+    let t = await run("pwr");
+    if (!/Power\s+Volt/.test(t)) { await link.sync(); t = await run("pwr"); }
+    if (!/Power\s+Volt/.test(t)) { await link.close(); throw new Error("NO_RESPONSE"); }
     const pcTime = new Date();
     step("step_time", {}, 8);
     const batTime = P.time(await run("time"));
@@ -173,6 +190,7 @@
         history.push(h);
       }
     }
+    await link.drain(300, 2000);   // nechat konzoli doběhnout, ať další spojení začíná v klidu
     await link.close();
     step("step_done", { n: mods.length }, 100);
 
@@ -180,7 +198,7 @@
       pcTime: pcTime.toISOString(),
       batTime,
       clockOff: batTime ? Math.round((new Date(batTime) - new Date(localIso(pcTime))) / 60000) : null,
-      woke, modules: mods, log, events, history: history.reverse(), raw
+      woke, modules: mods, log, events, history: history.reverse(), raw, trace: link.trace
     };
   }
 

@@ -2,7 +2,7 @@
 (function () {
   "use strict";
   const L = window.CSI18N, P = window.CSParse, C = window.CSConsole, A = window.CSAnalyse, DB = window.CSStore;
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.1";
   const REPO = "https://github.com/horakjun/cellscope";
 
   /* ---------- stav ---------- */
@@ -97,11 +97,25 @@
     render();
     const link = new C.Link(port);
     const logLine = s => { S.log.push(s); const el = $("con"); if (el) { el.textContent = S.log.join("\n"); el.scrollTop = el.scrollHeight; } };
+    const T0 = Date.now();
+    S.trace = null;
+    // obrazovka nemá usnout a prohlížeč má vědět, že stránka pracuje
+    let lock = null;
+    try { lock = await navigator.wakeLock.request("screen"); } catch (x) {}
+    const onHide = () => { if (document.hidden) logLine("⚠ " + t("hidden_warn")); };
+    document.addEventListener("visibilitychange", onHide);
+    const sec = ms => nf(ms / 1000, 1) + " s";
     try {
       const data = await C.readAll(link, { history: S.histOn ? S.thr.hist : 1, portName },
         st => { S.pct = st.pct; const pg = $("pg"); if (pg) pg.style.width = st.pct + "%"; logLine((st.key === "step_done" ? "✓ " : "› ") + t(st.key, st.vars)); },
-        c => { if (!/^data history \d/.test(c)) logLine("pylon> " + c); });
+        (c, txt, tr, retried) => {
+          const slow = tr && tr.ms > 3000;
+          if (!/^data history \d/.test(c) || slow || retried) logLine("pylon> " + c + (tr ? " · " + sec(tr.ms) : "") + (retried ? " · " + t("retried") : "") + (tr && !tr.ok ? " ✗" : ""));
+        });
       data.port = portName;
+      data.readMs = Date.now() - T0;
+      logLine("⏱ " + t("t_total", { s: sec(data.readMs) }) + (data.woke ? " · " + t("step_wake") : ""));
+      S.trace = { log: S.log.slice(), trace: data.trace, raw: data.raw };
       const rec = { id: demo ? "demo" : DB.uid(), custId, date: data.pcTime, data, note: "", demo: !!demo, version: VERSION };
       if (!demo) { await DB.put("measurements", rec); toast(t("saved", { c: cust(custId).name })); }
       await setMeas(rec);
@@ -111,7 +125,12 @@
       try { await link.close(); } catch (x) {}
       S.busy = false;
       S.err = e.message === "NO_RESPONSE" ? t("err_noresp") : /open|NetworkError|InvalidState/i.test(e.name + " " + e.message) ? t("err_port") : e.message;
+      logLine("✗ " + S.err + " · " + sec(Date.now() - T0));
+      S.trace = { log: S.log.slice(), trace: link.trace, raw: {} };
       render();
+    } finally {
+      document.removeEventListener("visibilitychange", onHide);
+      try { lock && lock.release(); } catch (x) {}
     }
   }
 
@@ -125,8 +144,10 @@
     let ok = false;
     try {
       await link.open(C.BAUD);
-      ok = await link.ping();
-      if (!ok) { await link.wakeUp(); ok = await link.ping(); }
+      let sy = await link.sync();
+      if (sy === "silent") { await link.wakeUp(); sy = await link.sync(); }   // probudit jen úplně tichou konzoli
+      ok = sy === "ok";
+      await link.drain(300, 1500);
     } catch (e) { S.err = t("err_port"); }
     try { await link.close(); } catch (e) {}
     S.busy = false; S.cable = ok; render();
@@ -169,6 +190,7 @@
  <section class="panel">
   <h2>${t("log_title")}</h2>
   <div class="console" id="con" aria-live="polite">${esc(S.log.join("\n"))}</div>
+  ${S.trace && !S.busy ? `<div><button class="btn small" data-act="savelog">${t("save_log")}</button></div>` : ""}
  </section>
 </div>`;
   };
@@ -521,6 +543,14 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
         await DB.put("customers", c); await loadCustomers(); S.custId = c.id; render(); break;
       }
       case "export": download("cellscope-zaloha-" + new Date().toISOString().slice(0, 10) + ".json", JSON.stringify(await DB.exportAll())); toast(t("backup_ok")); break;
+      case "savelog": {
+        const x = S.trace || {};
+        const txt = "CellScope " + VERSION + " · " + new Date().toISOString() + "\n\n" + (x.log || []).join("\n") +
+          "\n\n===== časy příkazů (ms) =====\n" + (x.trace || []).map(r => r.ms.toString().padStart(6) + "  " + (r.ok ? "ok " : "NE ") + " str." + r.pages + "  " + r.c).join("\n") +
+          "\n\n" + Object.entries(x.raw || {}).map(([k, v]) => "===== " + k + " =====\n" + v).join("\n");
+        download("cellscope-komunikace-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-") + ".txt", txt, "text/plain");
+        break;
+      }
       case "raw": {
         const r = S.meas.data.raw || {};
         download("cellscope-" + S.meas.date.slice(0, 10) + ".txt", Object.entries(r).map(([k, v]) => "===== " + k + " =====\n" + v).join("\n"), "text/plain");

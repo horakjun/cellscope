@@ -121,7 +121,10 @@
       this.ans = answers(this.M);
       this.awake = !opt.asleep;
       this.delay = opt.delay ?? 8;
-      this.slavePause = opt.slavePause ?? 0;   // pauza masteru u podřízených modulů (jako skutečná baterie)
+      this.slavePause = opt.slavePause ?? 0;
+      this.pwrDelay = opt.pwrDelay ?? 0;        // pomalá odpověď na pwr (16 modulů)
+      this.stale = opt.stale || "";             // zbytek výstupu z minulého spojení
+      this.garbage = 0;                         // probouzecí řetězce poslané do probuzené konzole   // pauza masteru u podřízených modulů (jako skutečná baterie)
       this.info = { usbVendorId: 0x067b, usbProductId: 0x23c3 };
     }
     getInfo() { return this.info; }
@@ -129,6 +132,7 @@
       this.baud = baudRate; this.inp = ""; this.pages = null;
       this.readable = new ReadableStream({ start: c => { this.ctl = c; }, cancel: () => { this.ctl = null; } });
       this.writable = new WritableStream({ write: chunk => this._rx(new TextDecoder().decode(chunk)) });
+      if (this.stale && baudRate === 115200 && this.awake) { const st = this.stale; this.stale = ""; setTimeout(() => this._tx(st), 30); }
     }
     async close() { try { this.ctl && this.ctl.close(); } catch (e) {} this.ctl = null; this.baud = 0; }
     _tx(s) { setTimeout(() => { try { this.ctl && this.ctl.enqueue(new TextEncoder().encode(s)); } catch (e) {} }, this.delay); }
@@ -138,7 +142,7 @@
       while ((k = this.inp.indexOf("\r")) >= 0) {
         const line = this.inp.slice(0, k).trim();
         this.inp = this.inp.slice(k + 1);
-        if (this.baud === 1200) { if (line.includes("20014682C0048520FCC3")) this.awake = true; continue; }
+        if (this.baud === 1200) { if (line.includes("20014682C0048520FCC3")) { if (this.awake) this.garbage++; this.awake = true; } continue; }
         if (!this.awake) continue;
         if (this.pages && line === "") { this._page(); continue; }
         this.pages = null;
@@ -146,7 +150,7 @@
         const r = this.ans.respond(line);
         this.pages = r.pages ? r.pages.slice() : [r.lines];
         this._tx(line + "\r\n@\r\n");
-        const pause = this.slavePause && /\s([2-9]|1\d)$/.test(line) ? this.slavePause : 0;
+        const pause = line === "pwr" ? this.pwrDelay : this.slavePause && /^(bat|info|stat|soh) ([2-9]|1\d)$/.test(line) ? this.slavePause : 0;
         if (pause) setTimeout(() => this._page(), pause); else this._page();
       }
     }
