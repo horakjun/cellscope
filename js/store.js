@@ -20,6 +20,8 @@
         };
         r.onsuccess = () => res(r.result);
         r.onerror = () => res(null);
+        r.onblocked = () => res(null);
+        setTimeout(() => res(null), 3000);   // když prohlížeč úložiště nepovolí, běžet aspoň bez ukládání
       } catch (e) { res(null); }
     });
     return dbp;
