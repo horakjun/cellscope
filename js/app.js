@@ -2,7 +2,7 @@
 (function () {
   "use strict";
   const L = window.CSI18N, P = window.CSParse, C = window.CSConsole, A = window.CSAnalyse, DB = window.CSStore;
-  const VERSION = "1.0.1";
+  const VERSION = "1.1.0";
   const REPO = "https://github.com/horakjun/cellscope";
 
   /* ---------- stav ---------- */
@@ -17,7 +17,7 @@
   /* ---------- pomocníci ---------- */
   const t = (k, v = {}) => (L[S.lang][k] ?? L.en[k] ?? k).replace(/\{(\w+)\}/g, (_, x) => (v[x] ?? ""));
   const loc = () => L[S.lang]._loc;
-  const nf = (n, d = 0) => (n == null || isNaN(n) ? "–" : new Intl.NumberFormat(loc(), { minimumFractionDigits: d, maximumFractionDigits: d }).format(n));
+  const nf = (n, d = 0) => (n == null || isNaN(n) ? "–" : new Intl.NumberFormat(loc(), { minimumFractionDigits: d, maximumFractionDigits: d, useGrouping: false }).format(n));
   const df = s => (s ? new Intl.DateTimeFormat(loc(), { dateStyle: "medium" }).format(new Date(s)) : "–");
   const dtf = s => (s ? new Intl.DateTimeFormat(loc(), { dateStyle: "short", timeStyle: "short" }).format(new Date(s)) : "–");
   const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -63,7 +63,7 @@
     return (await DB.all("measurements")).filter(m => m.custId === custId).sort((a, b) => b.date.localeCompare(a.date));
   }
   async function setMeas(m) {
-    S.meas = m; S.demo = !!(m && m.demo); S.sel = m && m.data.modules[0] ? m.data.modules[0].id : 1; S.prev = null;
+    S.meas = m; S.demo = !!(m && m.demo); S.sel = null; S.prev = null;
     if (m && m.custId) {
       const list = await measOf(m.custId);
       S.prev = list.find(x => x.date < m.date) || null;
@@ -173,102 +173,177 @@
 </div>`;
   };
 
+  /* ---------- přehled ve stylu karty „Zdraví baterie“ z HA ---------- */
+  const COL = ["#34d399", "#f59e0b", "#ef4444"];
+  const RANGE = 20;   // mV – plná barva článku při odchylce ±20 mV od průměru baterie (jako v HA)
+  const cellColor = (v, p) => {
+    const x = Math.max(-1, Math.min(1, (v - p) / RANGE)), u = Math.abs(x);
+    const hue = x < 0 ? 150 + 65 * u : 150 - 150 * x;
+    return `hsl(${hue.toFixed(0)},${(55 + 35 * u).toFixed(0)}%,${(36 + 8 * u).toFixed(0)}%)`;
+  };
+  const kwhOf = M => {
+    const m = String((M[0] && M[0].info && M[0].info.spec) || "").match(/(\d+(?:\.\d+)?)\s*V\s*\/\s*(\d+(?:\.\d+)?)\s*AH/i);
+    return m ? +m[1] * +m[2] / 1000 * M.length : null;
+  };
+
+  /* sloupcový graf rozptylu článků z historie BMS (jako denní špičky v HA) */
+  function spreadBars(ser, lim, W = 480, H = 100) {
+    if (ser.length < 2) return "";
+    const top = Math.max(lim * 1.4, 10, ...ser.map(s => s.spread));
+    const bw = W / Math.max(ser.length, 30), x0 = W - ser.length * bw;
+    let g = `<svg viewBox="0 0 ${W} ${H + 16}" role="img" aria-label="${esc(t("hist_title"))}">`;
+    ser.forEach((s, i) => {
+      const h = Math.max(1, Math.min(s.spread, top) / top * H);
+      const fill = s.spread > lim ? "#ef4444" : s.spread > lim * 0.75 ? "#f59e0b" : "#34d399";
+      g += `<rect x="${(x0 + i * bw + 0.5).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${Math.max(1, bw - 1).toFixed(1)}" height="${h.toFixed(1)}" rx="1" fill="${fill}"><title>${esc(dtf(realTime(s.t)))}: ${s.spread} mV · SOC ${s.soc} %</title></rect>`;
+    });
+    const ly = H - lim / top * H;
+    g += `<line x1="0" x2="${W}" y1="${ly.toFixed(1)}" y2="${ly.toFixed(1)}" stroke="#ef4444" stroke-dasharray="5 4"/><text x="2" y="${(ly - 4).toFixed(1)}" style="fill:#ef4444">limit ${lim} mV</text>`;
+    g += `<text x="${Math.max(0, Math.min(x0, W - 160)).toFixed(1)}" y="${H + 13}">${esc(dtf(realTime(ser[0].t)))}</text><text x="${W}" y="${H + 13}" text-anchor="end">${esc(dtf(realTime(ser[ser.length - 1].t)))}</text></svg>`;
+    return g;
+  }
+
   V.overview = () => {
     if (!S.meas) return emptyState();
-    const a = res(), d = S.meas.data, M = d.modules;
+    const a = res(), d = S.meas.data, M = d.modules, th = S.thr;
     const pw = M.map(m => m.pwr || {});
-    const volt = avg(pw.map(p => p.volt).filter(x => x != null)), cur = pw.reduce((s, p) => s + (p.curr || 0), 0);
-    const soc = avg(pw.map(p => p.soc).filter(x => x != null));
+    const type = (M[0] && M[0].info && M[0].info.name) || "US";
+    const kwh = kwhOf(M);
+    const sohs = M.map(m => m.stat && m.stat.soh).filter(x => x != null);
+    const soh = sohs.length ? Math.min(...sohs) : null;
+    const cyc = M.map(m => m.stat && m.stat.cycles).filter(x => x != null);
+    const cycles = cyc.length ? Math.max(...cyc) : null;
+    const read = M.filter(m => m.cells.length).length;
     const temps = M.flatMap(m => m.cells.map(c => c.temp)).filter(x => x != null);
-    const mos = pw.map(p => p.mos).filter(x => x != null);
-    const alarms = M.reduce((s, m) => s + Object.values((m.pwr && m.pwr.st) || {}).filter(v => !/^normal$/i.test(v)).length, 0);
-    const type = (M[0] && M[0].info && M[0].info.name) || "";
-    const name = S.demo ? t("demo_badge") : (cust(S.meas.custId) || {}).name || "";
-    return `
-<section class="verdict v-${LV[a.lvl]}"><span class="pill">${t("v_" + LV[a.lvl])}</span>
- <h2>${esc(name)} · ${M.length}× ${esc(type)} · ${dtf(S.meas.date)}</h2>
- ${a.f.some(f => f.l > 0) ? "" : `<p>${t("v_ok_text", { s: a.spread })}</p>`}
- ${a.f.length ? `<ul>${a.f.map(f => `<li class="l${f.l}">${esc(ftxt(f))}</li>`).join("")}</ul>` : ""}
-</section>
-<div class="kpis">
- ${kpi(t("k_modules"), M.length, esc(type))}
- ${kpi(t("k_soc"), nf(soc, 0) + " %", "")}
- ${kpi(t("k_voltage"), nf(volt, 2) + " V", "")}
- ${kpi(t("k_current"), sgn(cur, 1) + " A", stateTxt(pw[0] && pw[0].state))}
- ${kpi(t("k_spread"), a.spread + " mV", "≤ " + a.lim.s + " mV", a.spread > a.lim.s ? "warn" : "")}
- ${kpi(t("k_min"), nf(a.min.v / 1000, 3) + " V", "M" + a.min.m + " · #" + a.min.c)}
- ${kpi(t("k_max"), nf(a.max.v / 1000, 3) + " V", "M" + a.max.m + " · #" + a.max.c)}
- ${kpi(t("k_temp"), temps.length ? nf(Math.min(...temps), 1) + "–" + nf(Math.max(...temps), 1) + " °C" : "–", "")}
- ${kpi(t("k_mos"), mos.length ? nf(Math.max(...mos), 1) + " °C" : "–", a.mosHot.length ? "M" + a.mosHot.join(", M") : "", a.mosHot.length ? "warn" : "")}
- ${kpi(t("k_alarms"), alarms ? alarms : t("none"), "", alarms ? "bad" : "")}
- ${kpi(t("k_clock"), durf(d.clockOff), "≤ ±" + S.thr.clock + " min", a.clockBad ? "warn" : "")}
-</div>
-<section class="panel"><div class="scroll"><table>
- <thead><tr><th>${t("th_module")}</th><th>${t("th_type")}</th><th>${t("th_sn")}</th><th>${t("th_fw")}</th><th class="num">${t("k_voltage")}</th><th class="num">${t("k_current")}</th><th class="num">SOC</th><th class="num">SOH</th><th class="num">${t("th_cycles")}</th><th class="num">${t("k_spread")}</th><th class="num">${t("th_mos")}</th><th>${t("th_state")}</th><th>${t("th_bal")}</th></tr></thead>
+    const tlo = temps.length ? Math.min(...temps) : null, thi = temps.length ? Math.max(...temps) : null;
+    const mosL = M.filter(m => m.pwr && m.pwr.mos != null);
+    const mosMax = mosL.length ? mosL.reduce((x, m) => (m.pwr.mos > x.pwr.mos ? m : x)) : null;
+    const alarms = a.f.filter(f => f.k === "f_state");
+    const ser = A.histSeries(d), hmax = ser.length ? Math.max(...ser.map(s => s.spread)) : null;
+    const lim = a.lim.s;
+    const col = COL[a.lvl];
+
+    /* hodnocení – body s barevnými tečkami */
+    const li = [];
+    const fl = k => a.f.filter(f => f.k === k);
+    li.push([a.spread > lim ? COL[1] : COL[0], `<b>${t("li_bal")}</b> ${a.spread > lim ? t("li_bal_w", { s: a.spread, l: lim }) : t("li_bal_ok", { s: a.spread })}${hmax != null ? t("li_bal_h", { h: hmax }) : ""}`]);
+    let worst = null;
+    M.forEach(m => { const p = avg(mv(m)); m.cells.forEach(c => { const dv = c.mv - p; if (!worst || dv < worst.d) worst = { m: m.id, c: c.i, d: dv }; }); });
+    if (worst) {
+      const bad = Math.abs(worst.d) > a.lim.d;
+      li.push([bad ? COL[1] : COL[0], `<b>${t("li_cel")}</b> ${t("li_cel_t", { s: a.spread, m: worst.m, c: worst.c, d: nf(worst.d, 1) })}${bad ? t("li_cel_w") : t("li_cel_ok")}`]);
+    }
+    if (tlo != null) li.push([tlo < th.temp ? COL[1] : COL[0], `<b>${t("li_tmp")}</b> ${tlo < th.temp ? t("li_tmp_w", { a: nf(tlo, 1), b: nf(thi, 1), l: th.temp }) : t("li_tmp_ok", { a: nf(tlo, 1), b: nf(thi, 1) })}`]);
+    if (soh != null) li.push([soh < 90 ? COL[1] : COL[0], `<b>${t("li_soh")}</b> ${t("li_soh_t", { s: soh, c: cycles ?? "–", v: t(soh >= 95 ? "soh_v1" : soh >= 90 ? "soh_v2" : "soh_v3") })}`]);
+    if (mosL.length > 1) {
+      const hot = fl("f_mos");
+      li.push(hot.length ? [COL[1], `<b>${t("li_mos")}</b> ${hot.map(ftxt).map(esc).join(" ")}`] : [COL[0], `<b>${t("li_mos")}</b> ${t("li_mos_ok", { a: nf(Math.min(...mosL.map(m => m.pwr.mos)), 1), b: nf(mosMax.pwr.mos, 1) })}`]);
+    }
+    const bmsF = a.f.filter(f => /^f_stat|^f_soh|^f_reset/.test(f.k));
+    const bmsL = Math.max(0, ...bmsF.map(f => f.l));
+    li.push([bmsF.length || (d.events || []).length ? COL[bmsL || 1] : COL[0], `<b>${t("li_bms")}</b> ${bmsF.length || (d.events || []).length ? t("li_bms_w", { n: bmsF.length + (d.events || []).length }) : t("li_bms_ok")}`]);
+    fl("f_range").forEach(f => li.push([COL[2], `<b>${t("li_cel")}</b> ${esc(ftxt(f))}`]));
+    if (alarms.length) li.push([COL[2], `<b>${t("li_al")}</b> ${alarms.map(ftxt).map(esc).join(" ")}`]);
+    fl("f_noread").forEach(f => li.push([COL[1], `<b>${t("li_rd")}</b> ${esc(ftxt(f))}`]));
+    if (d.clockOff != null) li.push(["#60a5fa", `<b>${t("li_clk")}</b> ${a.clockBad ? t("li_clk_w", { d: durf(d.clockOff) }) : t("li_clk_ok")}`]);
+
+    /* pruh modulů: největší odchylka článku pod / nad průměrem modulu */
+    const md = M.map(m => {
+      const v = mv(m);
+      if (!v.length) return `<span data-mod="${m.id}" style="background:#334155"><b>${m.id}</b><br><small>–</small></span>`;
+      const p = avg(v), lo = Math.min(...v) - p, hi = Math.max(...v) - p, s = Math.max(-lo, hi);
+      const bg = s > a.lim.d ? "#b45309" : s > a.lim.d / 2 ? "#0f766e" : "#065f46";
+      return `<span data-mod="${m.id}" style="background:${bg}${S.sel === m.id ? ";box-shadow:inset 0 0 0 2px #93c5fd" : ""}"><b>${m.id}</b><br><small>${-lo >= 1 ? "▼" + nf(-lo, 0) : "&nbsp;"}${hi >= 1 ? " ▲" + nf(hi, 0) : ""}</small></span>`;
+    }).join("");
+
+    /* mapa všech článků: moduly ve sloupcích, články v řádcích */
+    const all = M.flatMap(m => mv(m)), pAll = avg(all);
+    const n = Math.max(0, ...M.map(m => m.cells.length));
+    const sel = S.sel, lo = a.min, hi = a.max;
+    let g = `<div class="gscroll"><div class="gr" style="grid-template-columns:2.4em repeat(${M.length},minmax(42px,1fr));min-width:${40 + M.length * 46}px"><div></div>`;
+    M.forEach(m => { g += `<button class="hd${sel === m.id ? " sel" : ""}" data-mod="${m.id}"><b>${m.id}</b><small>${m.pwr && m.pwr.soc != null ? m.pwr.soc + " %" : ""}</small></button>`; });
+    for (let c = 0; c < n; c++) {
+      g += `<div class="rl">${c + 1}</div>`;
+      M.forEach(m => {
+        const x = m.cells[c];
+        if (!x) { g += "<div></div>"; return; }
+        const k = (m.id === lo.m && c + 1 === lo.c ? " lo" : "") + (m.id === hi.m && c + 1 === hi.c ? " hi" : "") + (x.bal ? " bl" : "") + (sel && sel !== m.id ? " dm" : "");
+        g += `<div class="ce${k}" data-mod="${m.id}" style="background:${cellColor(x.mv, pAll)}" title="${esc(t("det_t", { m: m.id }))} · ${t("cell")} ${c + 1}: ${x.mv} mV · ${nf(x.temp, 1)} °C">${x.mv}</div>`;
+      });
+    }
+    g += "</div></div>";
+    const bal = M.reduce((s, m) => s + m.cells.filter(c => c.bal).length, 0);
+
+    /* detail vybraného modulu */
+    let det = "";
+    const sm = sel && M.find(m => m.id === sel);
+    if (sm && sm.cells.length) {
+      const cl = mv(sm), p = avg(cl), mn = Math.min(...cl), mx = Math.max(...cl), p0 = sm.pwr || {}, s0 = sm.stat || {}, i0 = sm.info || {};
+      const W = 1200, Hh = 80, bw = W / cl.length, rr = Math.max(5, ...cl.map(v => Math.abs(v - p)));
+      let sv = `<svg viewBox="0 0 ${W} ${Hh + 30}"><line x1="0" x2="${W}" y1="${Hh / 2}" y2="${Hh / 2}" stroke="rgba(255,255,255,.25)" stroke-dasharray="3 3"/>`;
+      sm.cells.forEach((c, i) => {
+        const dv = c.mv - p, h = Math.abs(dv) / rr * (Hh / 2 - 4), y = dv >= 0 ? Hh / 2 - h : Hh / 2;
+        sv += `<rect x="${(i * bw + 3).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw - 6).toFixed(1)}" height="${Math.max(1, h).toFixed(1)}" rx="2" fill="${cellColor(c.mv, pAll)}"/>`;
+        sv += `<text x="${(i * bw + bw / 2).toFixed(1)}" y="${Hh + 14}" text-anchor="middle" style="fill:#e2e8f0">${c.mv}</text><text x="${(i * bw + bw / 2).toFixed(1)}" y="${Hh + 28}" text-anchor="middle">${t("cell_short")} ${i + 1}${c.bal ? " ⚖" : ""}</text>`;
+      });
+      sv += `<text x="2" y="10">+${nf(rr, 1)} mV</text><text x="2" y="${Hh - 2}">−${nf(rr, 1)} mV</text></svg>`;
+      const ts = sm.cells.map(c => c.temp).filter(x => x != null), tset = [...new Set(ts)];
+      const bl = sm.cells.filter(c => c.bal).map(c => c.i);
+      det = `<div class="dt"><button class="x" data-mod="0">${t("close")}</button><b>${t("det_t", { m: sm.id })}</b> – ${t("det_s", { p: nf(p, 1) })} <span class="muted">· ${esc(i0.barcode || "")} ${i0.soft ? "· FW " + esc(i0.soft) : ""}</span>
+        <div class="kp"><div><small>${t("k_voltage")}</small><b>${nf(p0.volt, 2)} V</b><i>${stateTxt(p0.state)}</i></div>
+        <div><small>${t("k_current")}</small><b>${nf(p0.curr, 1)} A</b><i>${nf((p0.volt || 0) * (p0.curr || 0), 0)} W</i></div>
+        <div><small>SOC · SOH</small><b>${p0.soc != null ? p0.soc + " %" : "–"}</b><i>SOH ${s0.soh != null ? s0.soh + " %" : t("soh_na")} · ${t("th_cycles")} ${s0.cycles ?? "–"}</i></div>
+        <div><small>${t("k_spread")}</small><b class="${mx - mn > a.lim.s ? "wa" : "ok"}">${mx - mn} mV</b><i>${mn}–${mx} mV</i></div>
+        <div><small>${t("det_tmp")}</small><b>${ts.length ? nf(Math.min(...ts), 1) + "–" + nf(Math.max(...ts), 1) + " °C" : "–"}</b><i>${tset.map(x => nf(x, 1)).join(" · ")} · MOS ${nf(p0.mos, 1)} °C</i></div>
+        <div><small>${t("th_bal")}</small><b>${bl.length}</b><i>${bl.length ? t("det_list", { l: bl.join(", ") }) : t("det_none")}</i></div></div>${sv}</div>`;
+    }
+
+    /* deník událostí BMS */
+    const L0 = (d.log || []).slice(0, 12);
+    const ev = `<div class="mp"><div class="mph"><b class="t">${t("ev_t")}</b><span>${t("ev_s", { n: (d.log || []).length })}</span></div>` +
+      (L0.length ? `<div class="scroll"><table>${L0.map(e => { const norm = /start (dis)?charg/i.test(e.info || ""); return `<tr><td style="width:1%"><span class="tg" style="background:${norm ? "#94a3b8" : "#f59e0b"}">${norm ? (/dis/i.test(e.info) ? t("st_dis") : t("st_chg")) : esc(e.code || "!")}</span></td><td class="mono" style="width:1%">${dtf(realTime(e.date))}</td><td class="tw">${esc(e.info || "")}</td></tr>`; }).join("")}</table></div>` : `<div class="leg">–</div>`) + `</div>`;
+
+    /* tabulka modulů */
+    const tbl = `<div class="mp"><div class="mph"><b class="t">${t("mods_t")}</b></div><div class="scroll"><table>
+ <thead><tr><th>${t("th_module")}</th><th>${t("th_type")}</th><th>${t("th_sn")}</th><th>${t("th_fw")}</th><th class="num">${t("k_voltage")}</th><th class="num">${t("k_current")}</th><th class="num">SOC</th><th class="num">SOH</th><th class="num">${t("th_cycles")}</th><th class="num">${t("k_spread")}</th><th class="num">${t("th_mos")}</th><th>${t("th_state")}</th></tr></thead>
  <tbody>${M.map(m => {
    const v = mv(m), sp = v.length ? Math.max(...v) - Math.min(...v) : null, p = m.pwr || {}, i = m.info || {}, s = m.stat || {};
    const nonNorm = Object.values(p.st || {}).some(x => !/^normal$/i.test(x));
-   return `<tr class="click" data-mod="${m.id}">
-   <td><b>${m.id}</b>${m.id === M[0].id ? ' <span class="chip">master</span>' : ""}</td><td>${esc(i.name || "–")}</td><td class="mono">${esc(i.barcode || "–")}</td><td class="mono">${esc(i.soft || i.mainSoft || "–")}</td>
+   return `<tr class="click" data-mod="${m.id}"><td><b>${m.id}</b>${m.id === M[0].id ? ' <span class="chip">master</span>' : ""}</td><td>${esc(i.name || "–")}</td><td class="mono">${esc(i.barcode || "–")}</td><td class="mono">${esc(i.soft || i.mainSoft || "–")}</td>
    <td class="num">${nf(p.volt, 2)} V</td><td class="num">${sgn(p.curr, 1)} A</td><td class="num">${p.soc != null ? p.soc + " %" : "–"}</td>
    <td class="num">${s.soh == null ? `<span class="muted">${t("soh_na")}</span>` : s.soh < 95 ? `<span class="chip warn">${s.soh} %</span>` : s.soh + " %"}</td>
    <td class="num">${s.cycles ?? "–"}</td><td class="num">${sp != null ? sp + " mV" : "–"}</td>
    <td class="num">${p.mos == null ? "–" : a.mosHot.includes(m.id) ? `<span class="chip warn">${nf(p.mos, 1)} °C</span>` : nf(p.mos, 1) + " °C"}</td>
-   <td><span class="chip ${nonNorm ? "bad" : "acc"}">${stateTxt(p.state)}</span></td>
-   <td>${m.cells.some(c => c.bal) ? `<span class="chip" style="color:var(--bal)">${t("yes")}</span>` : t("no")}</td></tr>`;
- }).join("")}</tbody>
-</table></div></section>`;
-  };
+   <td><span class="chip ${nonNorm ? "bad" : "acc"}">${stateTxt(p.state)}</span></td></tr>`;
+ }).join("")}</tbody></table></div></div>`;
 
-  V.cells = () => {
-    if (!S.meas) return emptyState();
-    const a = res(), lim = a.lim.d, M = mods();
-    const m = M.find(x => x.id === S.sel) || M[0], av = avg(mv(m));
-    const n = Math.max(...M.map(x => x.cells.length));
-    const lvlOf = dv => (Math.abs(dv) > lim ? 2 : Math.abs(dv) > lim / 2 ? 1 : 0);
-    return `
-<section class="panel">
- <div class="row center spread"><h1>${t("nav_cells")}</h1>
- <div class="legend"><span><i style="background:var(--ok-soft)"></i>${t("lg_ok")}</span><span><i style="background:var(--warn-soft)"></i>${t("lg_warn")}</span><span><i style="background:var(--bad-soft);outline:1px solid var(--bad)"></i>${t("lg_bad")} (±${lim} mV)</span><span><i style="background:var(--bal);border-radius:50%;width:8px;height:8px"></i>${t("lg_bal")}</span></div></div>
- <p class="muted">${t("cells_hint")}</p>
- <div class="scroll"><div class="map" style="grid-template-columns:72px repeat(${n},minmax(46px,1fr));min-width:${72 + n * 52}px">
-  <div></div>${Array.from({ length: n }, (_, i) => `<div class="mh">${i + 1}</div>`).join("")}
-  ${M.map(md => { const a2 = avg(mv(md)); return `<button class="ml ${md.id === m.id ? "sel" : ""}" data-sel="${md.id}">M${md.id}<small>${nf(a2, 0)} mV</small></button>` +
-    md.cells.map(c => { const dv = c.mv - a2; return `<div class="c l${lvlOf(dv)} ${c.bal ? "balc" : ""}" data-sel="${md.id}" title="M${md.id} #${c.i}: ${c.mv} mV, ${nf(c.temp, 1)} °C">${c.mv}<small>${sgn(Math.round(dv))}</small></div>`; }).join("") +
-    Array.from({ length: n - md.cells.length }, () => "<div></div>").join(""); }).join("")}
- </div></div>
-</section>
-<section class="panel">
- <h2>${t("detail", { m: m.id })} <span class="muted mono" style="font-size:13px">${esc((m.info && m.info.barcode) || "")} · ${t("avg")} ${nf(av, 0)} mV</span></h2>
- <div class="scroll"><table><thead><tr><th>${t("cell")}</th><th class="num">mV</th><th class="num">${t("dev")}</th><th class="num">°C</th><th>${t("th_bal")}</th><th>SOH</th></tr></thead>
- <tbody>${m.cells.map(c => { const dv = c.mv - av, l = lvlOf(dv), sh = (m.soh || []).find(x => x.i === c.i);
-   return `<tr><td>#${c.i}</td><td class="num">${c.mv}</td><td class="num">${l ? `<span class="chip ${l === 2 ? "bad" : "warn"}">${sgn(Math.round(dv))}</span>` : sgn(Math.round(dv))}</td><td class="num">${nf(c.temp, 1)}</td><td>${c.bal ? `<span style="color:var(--bal)">●</span> ${t("yes")}` : "—"}</td><td>${sh ? (sh.count || !/^normal$/i.test(sh.status) ? `<span class="chip warn">${esc(sh.status)} · ${sh.count}</span>` : esc(sh.status)) : "–"}</td></tr>`; }).join("")}</tbody></table></div>
-</section>`;
+    const name = S.demo ? t("demo_badge") : (cust(S.meas.custId) || {}).name || "";
+    return `<div class="c" style="--c:${col}">
+ <div class="hero"><div class="pic"><img src="${window.CS_BATTERY_IMG || "icons/baterie.webp"}" alt="" onerror="this.style.display='none'"></div>
+  <div class="inf"><small>${esc(t("hero", { n: M.length, type, kwh: kwh != null ? nf(kwh, 1) : "–" }))}</small>
+   <div class="vd">${t(["vd_ok", "vd_watch", "vd_bad"][a.lvl])}</div>
+   <div class="sb">${[alarms.length ? t("sb_al", { n: alarms.length }) : t("sb_al0"), a.spread > lim ? t("sb_bal", { s: a.spread }) : t("sb_bal0"), read < M.length ? t("sb_mod", { a: read, n: M.length }) : t("sb_mod0", { n: M.length })].join(" · ")}</div>
+   <div class="sb" style="opacity:.55;margin-top:2px">${esc(name)} · ${dtf(S.meas.date)}</div></div>
+  <div class="big"><b>${soh != null ? soh + " %" : "–"}</b><span> SOH</span><br><span>${t("soh_big")}</span></div></div>
+ <div class="kp">
+  <div><small>${t("kp_cyc")}</small><b>${cycles ?? "–"}</b><i>${cycles != null ? t("kp_cyc_sub", { p: nf(cycles / 6000 * 100, 1), max: 6000 }) : "&nbsp;"}</i></div>
+  <div><small>${t("kp_bal")}</small><b class="${a.spread > lim ? "bad" : a.spread > lim * 0.75 ? "wa" : "ok"}">${a.spread} mV</b><i>${t("kp_bal_sub", { l: lim, h: hmax ?? "–" })}</i></div>
+  <div><small>${t("kp_tmp")}</small><b class="${tlo != null && tlo < th.temp ? "wa" : ""}">${tlo != null ? nf(tlo, 1) + "–" + nf(thi, 1) + " °C" : "–"}</b><i>${temps.length ? t("kp_tmp_sub", { a: nf(avg(temps), 1) }) : "&nbsp;"}</i></div>
+  <div><small>${t("kp_mod")}</small><b class="${read < M.length ? "bad" : "ok"}">${read} / ${M.length}</b><i>${t("kp_mod_sub")}</i></div>
+  <div><small>${t("k_mos")}</small><b class="${a.mosHot.length ? "wa" : ""}">${mosMax ? nf(mosMax.pwr.mos, 1) + " °C" : "–"}</b><i>${mosMax ? t("kp_mos_sub", { m: mosMax.id }) : "&nbsp;"}</i></div>
+ </div>
+ <div class="mid"><div class="ch">${ser.length > 1 ? spreadBars(ser, lim) + `<div class="leg">${t("ch_leg", { n: ser.length })}</div>` : `<div class="leg">${t("ch_none")}</div>`}
+   <div class="leg" style="margin-top:12px">${t("md_leg")}</div><div class="md">${md}</div></div>
+  <ul class="hl">${li.map(x => `<li><u style="--d:${x[0]}"></u><p>${x[1]}</p></li>`).join("")}</ul></div>
+ <div class="mp"><div class="mph"><b class="t">${t("map_t", { n: all.length })}</b><span>${t("map_s", { s: a.spread, a: lo.v, b: hi.v, p: nf(pAll, 1), k: bal })}</span>
+   <i>${t("map_time", { t: dtf(S.meas.date) })}</i><button class="bt" data-act="reread" ${S.busy ? "disabled" : ""}>${t("reread")}</button></div>
+  ${g}
+  <div class="lg"><span>${t("map_lo")}<em></em>${t("map_hi", { r: RANGE })}</span><span>${t("map_fr", { lo: `<b>${lo.m}/${lo.c} ${lo.v} mV</b>`, hi: `<b>${hi.m}/${hi.c} ${hi.v} mV</b>` })}</span><span>${t("map_click")}</span></div>
+  ${det}</div>
+ ${ev}
+ ${tbl}
+</div>`;
   };
-
-  function histChart(series) {
-    if (series.length < 2) return "";
-    const W = 760, H = 220, L0 = 44, R0 = 40, T0 = 12, B0 = 28;
-    const t0 = new Date(series[0].t).getTime(), t1 = new Date(series[series.length - 1].t).getTime() || t0 + 1;
-    const maxS = Math.max(10, S.thr.spread + 5, ...series.map(s => s.spread));
-    const sMax = Math.ceil(maxS / 10) * 10;
-    const x = tm => L0 + (new Date(tm).getTime() - t0) / Math.max(1, t1 - t0) * (W - L0 - R0);
-    const yS = v => T0 + (1 - v / sMax) * (H - T0 - B0);
-    const yP = v => T0 + (1 - v / 100) * (H - T0 - B0);
-    const line = (f, k) => series.map((s, i) => (i ? "L" : "M") + x(s.t).toFixed(1) + " " + f(s[k]).toFixed(1)).join(" ");
-    const ticks = [0, .5, 1].map(f => Math.round(f * sMax));
-    const xt = [0, .5, 1].map(f => new Date(t0 + f * (t1 - t0)));
-    const lim = S.thr.spread;
-    return `<div class="scroll"><svg class="chart" viewBox="0 0 ${W} ${H}" style="width:100%;min-width:520px;height:auto" role="img" aria-label="${esc(t("hist_title"))}">
- ${ticks.map(v => `<line class="grid" x1="${L0}" x2="${W - R0}" y1="${yS(v)}" y2="${yS(v)}"/><text x="${L0 - 6}" y="${yS(v) + 4}" text-anchor="end">${v}</text>`).join("")}
- ${[0, 50, 100].map(v => `<text x="${W - R0 + 6}" y="${yP(v) + 4}">${v}%</text>`).join("")}
- ${lim < sMax ? `<line x1="${L0}" x2="${W - R0}" y1="${yS(lim)}" y2="${yS(lim)}" stroke="var(--warn)" stroke-dasharray="4 4"/>` : ""}
- <path d="${line(yP, "soc")}" fill="none" stroke="var(--muted)" stroke-width="1.4" opacity=".7"/>
- <path d="${line(yS, "spread")}" fill="none" stroke="var(--accent)" stroke-width="2"/>
- ${xt.map((d, i) => `<text x="${L0 + i / 2 * (W - L0 - R0)}" y="${H - 8}" text-anchor="${["start", "middle", "end"][i]}">${esc(dtf(realTime(d.toISOString())))}</text>`).join("")}
-</svg></div>
-<div class="legend"><span><i style="background:var(--accent)"></i>${t("hist_spread")}</span><span><i style="background:var(--muted)"></i>${t("hist_soc")}</span>${lim < sMax ? `<span><i style="background:var(--warn)"></i>${t("lg_bad")} ${lim} mV</span>` : ""}</div>`;
-  }
 
   V.bms = () => {
     if (!S.meas) return emptyState();
@@ -288,7 +363,7 @@
  ${flagged.length ? `<h3>${t("flagged_cells")}</h3><div class="chips">${flagged.map(c => `<span class="chip warn">M${c.m} #${c.i}: ${esc(c.status)} · ${c.count}</span>`).join("")}</div>` : ""}
 </section>
 <section class="panel"><h2>${t("hist_title")} <span class="muted mono" style="font-size:12px">data history</span></h2>
- ${ser.length > 1 ? `<p class="muted">${t("hist_note", { n: ser.length, a: dtf(realTime(ser[0].t)), b: dtf(realTime(ser[ser.length - 1].t)) })}</p>${histChart(ser)}` : `<p class="muted">${t("hist_none")}</p>`}
+ ${ser.length > 1 ? `<p class="muted">${t("hist_note", { n: ser.length, a: dtf(realTime(ser[0].t)), b: dtf(realTime(ser[ser.length - 1].t)) })}</p><div class="ch" style="width:100%">${spreadBars(ser, S.thr.spread, 1300, 170)}</div>` : `<p class="muted">${t("hist_none")}</p>`}
 </section>
 <div class="grid2">
 <section class="panel"><h2>${t("bms_log")} <span class="muted mono" style="font-size:12px">log</span></h2>
@@ -382,8 +457,6 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
   ${f("c_name", t("set_name"), c.name)}${f("c_addr", t("set_addr"), c.addr)}<div class="row">${f("c_ico", t("set_ico"), c.ico)}${f("c_contact", t("set_contact"), c.contact)}</div>
   <div class="field"><label for="c_logo">${t("set_logo")}</label><input id="c_logo" type="file" accept="image/*"></div>
   ${S.logo ? `<div class="row center"><img src="${S.logo}" alt="" style="max-height:48px;max-width:160px;background:#fff;padding:4px;border-radius:4px"><button class="btn small danger" data-act="nologo">${t("del")}</button></div>` : ""}
-  <h2>${t("set_look")}</h2>
-  <div class="seg" role="group">${["system", "light", "dark"].map(x => `<button data-theme-set="${x}" aria-pressed="${S.theme === x}">${t("th_" + x)}</button>`).join("")}</div>
  </section>
  <section class="panel"><h2>${t("set_thr")}</h2>
   <div class="thr">${f("t_spread", t("t_spread"), th.spread, "number", "1")}${f("t_dev", t("t_dev"), th.dev, "number", "1")}${f("t_lo", t("t_lo"), th.lo, "number", "0.01")}${f("t_hi", t("t_hi"), th.hi, "number", "0.01")}${f("t_temp", t("t_temp"), th.temp, "number", "1")}${f("t_endS", t("t_end_s"), th.endS, "number", "1")}${f("t_endD", t("t_end_d"), th.endD, "number", "1")}${f("t_mos", t("t_mos"), th.mos, "number", "0.5")}${f("t_clock", t("t_clock"), th.clock, "number", "1")}${f("t_hist", t("hist_count"), th.hist, "number", "10")}</div>
@@ -398,7 +471,7 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
  <p class="muted">${t("install_hint")}</p></section>`;
 
   /* ---------- vykreslení ---------- */
-  const TABS = ["connect", "overview", "cells", "bms", "compare", "customers", "report", "settings", "about"];
+  const TABS = ["connect", "overview", "bms", "compare", "customers", "report", "settings", "about"];
   function render() {
     document.documentElement.lang = S.lang;
     $("sub").textContent = t("sub");
@@ -409,16 +482,14 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
     if (S.tab === "customers") fillMeas();
     const con = $("con"); if (con) con.scrollTop = con.scrollHeight;
   }
-  function applyTheme() { const r = document.documentElement; if (S.theme === "system") delete r.dataset.theme; else r.dataset.theme = S.theme; }
 
   /* ---------- události ---------- */
   document.addEventListener("click", async e => {
-    const el = e.target.closest("[data-go],[data-act],[data-sel],[data-mod],[data-cust],[data-open],[data-delm],[data-delc],[data-theme-set]");
+    const el = e.target.closest("[data-go],[data-act],[data-mod],[data-cust],[data-open],[data-delm],[data-delc]");
     if (!el || el.disabled) return;
     const ds = el.dataset;
     if (ds.go) { S.tab = ds.go; S.delArm = null; render(); window.scrollTo(0, 0); return; }
-    if (ds.sel) { S.sel = +ds.sel; render(); return; }
-    if (ds.mod) { S.sel = +ds.mod; S.tab = "cells"; render(); return; }
+    if (ds.mod) { const m = +ds.mod; S.sel = !m || S.sel === m ? null : m; if (S.tab !== "overview") S.tab = "overview"; render(); return; }
     if (ds.cust) { S.custId = ds.cust; S.newCust = false; S.delArm = null; DB.setSetting("lastCust", S.custId); render(); return; }
     if (ds.open) { await setMeas(await DB.get("measurements", ds.open)); S.tab = "overview"; render(); return; }
     if (ds.delm) {
@@ -433,10 +504,13 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
       if (S.meas && S.meas.custId === ds.delc) await setMeas(null);
       S.custId = null; S.delArm = null; await loadCustomers(); render(); return;
     }
-    if (ds.themeSet) { S.theme = ds.themeSet; DB.setSetting("theme", S.theme); applyTheme(); render(); return; }
     switch (ds.act) {
       case "read": readBattery(false); break;
       case "demo": S.tab = "connect"; readBattery(true); break;
+      case "reread":
+        if (S.demo) { S.tab = "connect"; readBattery(true); }
+        else { S.custId = S.meas.custId; S.newCust = false; S.tab = "connect"; render(); readBattery(false); }
+        break;
       case "cable": cableTest(); break;
       case "print": window.print(); break;
       case "thrreset": S.thr = { ...A.DEF_THR }; DB.setSetting("thr", S.thr); render(); break;
@@ -486,7 +560,6 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
     const nav = (navigator.language || "en").slice(0, 2);
     S.lang = await DB.setting("lang", L[nav] ? nav : "en");
     if (!L[S.lang]) S.lang = "en";
-    S.theme = await DB.setting("theme", "system");
     S.thr = { ...A.DEF_THR, ...(await DB.setting("thr", {})) };
     S.histOn = await DB.setting("histOn", true);
     S.company = { ...S.company, ...(await DB.setting("company", {})) };
@@ -496,7 +569,7 @@ ${S.meas && !S.demo ? `<section class="panel"><div class="field"><label for="not
     S.custId = cust(last) ? last : (S.customers[0] && S.customers[0].id) || null;
     $("lang").innerHTML = Object.entries(L).map(([k, v]) => `<option value="${k}">${v._n}</option>`).join("");
     $("lang").value = S.lang;
-    applyTheme(); render();
+    render();
     if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
   })();
 })();
