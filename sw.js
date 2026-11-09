@@ -1,5 +1,5 @@
 /* CellScope – offline provoz. Při nové verzi stačí zvýšit VERSION. */
-const VERSION = "cellscope-1.0.0";
+const VERSION = "cellscope-1.0.1";
 const FILES = ["./", "index.html", "manifest.webmanifest", "js/i18n.js", "js/parse.js", "js/console.js", "js/demo.js",
   "js/analyse.js", "js/store.js", "js/app.js", "icons/icon.svg", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png"];
 

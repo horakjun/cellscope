@@ -121,6 +121,7 @@
       this.ans = answers(this.M);
       this.awake = !opt.asleep;
       this.delay = opt.delay ?? 8;
+      this.slavePause = opt.slavePause ?? 0;   // pauza masteru u podřízených modulů (jako skutečná baterie)
       this.info = { usbVendorId: 0x067b, usbProductId: 0x23c3 };
     }
     getInfo() { return this.info; }
@@ -145,7 +146,8 @@
         const r = this.ans.respond(line);
         this.pages = r.pages ? r.pages.slice() : [r.lines];
         this._tx(line + "\r\n@\r\n");
-        this._page();
+        const pause = this.slavePause && /\s([2-9]|1\d)$/.test(line) ? this.slavePause : 0;
+        if (pause) setTimeout(() => this._page(), pause); else this._page();
       }
     }
     _page() {

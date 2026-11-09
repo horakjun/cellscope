@@ -2,7 +2,7 @@
 (function () {
   "use strict";
   const L = window.CSI18N, P = window.CSParse, C = window.CSConsole, A = window.CSAnalyse, DB = window.CSStore;
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.1";
   const REPO = "https://github.com/horakjun/cellscope";
 
   /* ---------- stav ---------- */
@@ -43,7 +43,7 @@
   /* text nálezu – {what} je klíč popisu počítadla, čísla se formátují podle jazyka */
   function ftxt(f) {
     const v = { ...f.v };
-    if (v.what) v.what = t(v.what);
+    if (v.what && f.k !== "f_noread") v.what = t(v.what);
     if (f.k === "f_range") { v.v = nf(v.v, 3); v.lo = nf(v.lo, 2); v.hi = nf(v.hi, 2); }
     if (f.k === "f_dev") v.d = sgn(Math.round(v.d));
     if (f.k === "f_temp" || f.k === "f_mos") { v.t = nf(v.t, 1); if (v.d != null) v.d = nf(v.d, 1); }

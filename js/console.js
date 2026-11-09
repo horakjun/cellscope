@@ -46,8 +46,10 @@
       try { await w.write(new TextEncoder().encode(s)); } finally { w.releaseLock(); }
     }
 
-    /* čeká, dokud buffer nesplní podmínku, nebo dokud nepřestanou chodit data */
-    async waitFor(test, limitMs = 6000, idleMs = 1200) {
+    /* čeká, dokud buffer nesplní podmínku (nebo do limitu).
+       idleMs > 0: skončí i po takové pauze v datech – jen pro ping; odpovědi příkazů se čtou vždy až do „$$“,
+       protože master u podřízených modulů dělá před odpovědí pauzu. */
+    async waitFor(test, limitMs = 6000, idleMs = 0) {
       const t0 = Date.now();
       let last = Date.now(), len = this.buf.length;
       while (Date.now() - t0 < limitMs) {
@@ -55,23 +57,40 @@
         await new Promise(r => { this.wake = r; setTimeout(r, 100); });
         this.wake = null;
         if (this.buf.length !== len) { len = this.buf.length; last = Date.now(); }
-        else if (len && Date.now() - last > idleMs) return test(this.buf);
+        else if (idleMs && len && Date.now() - last > idleMs) return test(this.buf);
       }
       return test(this.buf);
     }
 
-    /* jeden čtecí příkaz se stránkováním (na výzvu „Press [Enter]“ se posílá jen Enter) */
-    async cmd(c, maxPages = 60) {
+    /* počká, až konzole přestane posílat (zbytky předchozí odpovědi), a buffer vyprázdní */
+    async drain(quietMs = 400, limitMs = 3000) {
+      const t0 = Date.now();
+      let len = -1;
+      while (Date.now() - t0 < limitMs && this.buf.length !== len) { len = this.buf.length; await sleep(quietMs); }
+      this.buf = "";
+    }
+
+    /* jeden čtecí příkaz se stránkováním (na výzvu „Press [Enter]“ se posílá jen Enter).
+       Vrací text; this.lastOk = false, když nedorazil konec odpovědi „$$“. */
+    async cmd(c, maxPages = 60, limitMs = 15000) {
       if (!isAllowed(c)) throw new Error("Příkaz není povolen: " + c);
       this.buf = "";
       await this.writeRaw(c + "\r");
       let out = "";
+      this.lastOk = false;
       for (let p = 0; p < maxPages; p++) {
-        await this.waitFor(b => /\$\$/.test(b) || /Press \[Enter\]/.test(b));
+        const got = await this.waitFor(b => /\$\$/.test(b) || /Press \[Enter\]/.test(b), limitMs);
+        const done = /\$\$/.test(this.buf);
+        if (done) {
+          // po „$$“ ještě dorazí prompt – počkat na něj, ať nezůstane v odpovědi dalšího příkazu
+          const k = this.buf.indexOf("$$");
+          await this.waitFor(b => />\s*$/.test(b.slice(k)), 600);
+          out += this.buf; this.buf = ""; this.lastOk = true; break;
+        }
         out += this.buf;
-        const more = /Press \[Enter\]/.test(this.buf) && !/\$\$/.test(this.buf);
+        const more = got && /Press \[Enter\]/.test(this.buf);
         this.buf = "";
-        if (!more) break;
+        if (!more) { await this.drain(); break; }    // konec nedorazil – nechat doběhnout, ať se nemíchá s dalším příkazem
         await this.writeRaw("\r");
       }
       return out;
@@ -99,12 +118,20 @@
   async function readAll(link, opt = {}, onStep = () => {}, onRaw = () => {}) {
     const raw = {};
     const step = (key, vars = {}, pct) => onStep({ key, vars, pct });
-    const run = async c => { const t = await link.cmd(c); raw[c] = t; onRaw(c, t); return t; };
+    /* příkaz; když nedorazí konec odpovědi, zkusí se ještě jednou */
+    const run = async c => {
+      let t = await link.cmd(c);
+      if (!link.lastOk) { await link.drain(500, 4000); t = await link.cmd(c); }
+      raw[c] = t; onRaw(c, t); return t;
+    };
 
     step("step_open", { p: opt.portName || "COM" }, 2);
     await link.open(BAUD);
     let woke = false;
-    let t = await run("pwr");
+    // první dotaz krátce a bez opakování – spící konzole neodpoví vůbec
+    let t = await link.cmd("pwr", 60, 3000);
+    if (!/Power\s+Volt/.test(t)) await link.drain(300, 1500);
+    else { raw.pwr = t; onRaw("pwr", t); }
     if (!/Power\s+Volt/.test(t)) {
       step("step_wake", {}, 5);
       await link.wakeUp();
@@ -122,7 +149,8 @@
     for (let k = 0; k < ids.length; k++) {
       const id = ids[k];
       step("step_bat", { m: id, n: ids.length }, 10 + Math.round(k / ids.length * 55));
-      const cells = P.bat(await run("bat " + id));
+      let cells = P.bat(await run("bat " + id));
+      if (!cells.length) { await link.drain(500, 4000); cells = P.bat(await run("bat " + id)); }
       const inf = P.info(await run("info " + id));
       const st = P.stat(await run("stat " + id));
       const sh = P.soh(await run("soh " + id));

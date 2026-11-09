@@ -42,6 +42,11 @@
     mods.forEach(m => mv(m).forEach((v, i) => all.push({ m: m.id, c: i + 1, v })));
     if (!all.length) return { lvl: 0, f: [], spread: null, min: null, max: null, lim: { s: th.spread, d: th.dev }, mosHot: [], clockBad: false, empty: true };
 
+    // neúplně načtené moduly (chybí články, info nebo statistika)
+    mods.forEach(m => {
+      const miss = [!(m.cells || []).length && "bat", !(m.info && m.info.barcode) && "info", !(m.stat && m.stat.cycles != null) && "stat", !(m.soh || []).length && "soh"].filter(Boolean);
+      if (miss.length) add(1, "f_noread", { m: m.id, what: miss.join(", ") });
+    });
     const min = all.reduce((a, b) => (b.v < a.v ? b : a));
     const max = all.reduce((a, b) => (b.v > a.v ? b : a));
     const spread = max.v - min.v;
