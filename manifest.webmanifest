@@ -1,0 +1,16 @@
+{
+  "name": "CellScope for Pylontech",
+  "short_name": "CellScope",
+  "description": "Kontrola baterií Pylontech US2000 / US3000 / US5000 přes konzolový kabel.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eef2f2",
+  "theme_color": "#0b6e7a",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
